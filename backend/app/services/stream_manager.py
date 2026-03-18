@@ -58,6 +58,7 @@ class EnterpriseStreamManager:
         
         # ── Lifecycle Locks ──
         self._start_lock = threading.Lock()
+        self._cap_lock = threading.Lock() # 🔒 Ensure read/release NEVER happen at once
         
         # ── Async Synchronization (Multi-subscriber support) ──
         self.main_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -97,9 +98,10 @@ class EnterpriseStreamManager:
     def stop(self):
         """Safely signals all threads to stop and releases hardware resources."""
         self._stop_event.set()
-        if self.cap:
-            self.cap.release()
-            self.cap = None
+        with self._cap_lock:
+            if self.cap:
+                self.cap.release()
+                self.cap = None
         
         # Ensure latest frame is cleared so WebRTC doesn't stream stale data
         with self._frame_lock:
@@ -110,8 +112,10 @@ class EnterpriseStreamManager:
     def pause(self):
         print("  [StreamManager] Pausing stream...")
         self._stop_event.set()
-        if self.cap:
-            self.cap.release()
+        with self._cap_lock:
+            if self.cap:
+                self.cap.release()
+                self.cap = None
             
     def resume(self):
         print("  [StreamManager] Resuming stream...")
@@ -125,48 +129,46 @@ class EnterpriseStreamManager:
         print(f"  [StreamManager] Starting Enterprise Capture: {self.rtsp_url}")
         
         try:
-            # Use TCP for stability and single thread for HEVC/FFMPEG assertion stability
-            import os
-            # Use different separator syntax for FFMPEG options to ensure they are parsed correctly
+            # Ensure FFmpeg options are set for TCP and Single-Thread stability
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|threads;1"
+            
             while not self._stop_event.is_set():
                 try:
-                    # Clear any old state before attempting open
-                    if self.cap: self.cap.release()
-                    
-                    print(f"  [StreamManager] Connecting to RTSP... {self.rtsp_url}")
-                    self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-                    
-                    if not self.cap.isOpened():
-                        print("  [StreamManager] Link failed. Retrying in 5s...")
+                    with self._cap_lock:
+                        if self.cap: self.cap.release()
+                        print(f"  [StreamManager] Connecting to RTSP... {self.rtsp_url}")
+                        self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                        
+                        if not self.cap.isOpened():
+                            print("  [StreamManager] Link failed. Retrying in 5s...")
+                        else:
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                    if self.cap is None or not self.cap.isOpened():
                         time.sleep(5)
                         continue
-                        
-                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     
                     # Target resolution for Kiosk (1280x720 720p HD)
                     self.TARGET_WIDTH = 1280 
                     self.TARGET_HEIGHT = 720 
                     
                     self._last_mjpeg_time = 0
-                    self._mjpeg_interval = 1.0 / 20.0 # 20 FPS is the perfect 'smooth' balance
+                    self._mjpeg_interval = 1.0 / 20.0 # 20 FPS balance
 
                     frame_count = 0
                     start_time = time.time()
-                    self._source_h, self._source_w = 0, 0 # Initialize
+                    self._source_h, self._source_w = 0, 0 
 
                     while not self._stop_event.is_set():
                         ret = False
                         frame = None
                         try:
-                            ret, frame = self.cap.read()
+                            with self._cap_lock:
+                                if self.cap:
+                                    ret, frame = self.cap.read()
                         except Exception as read_err:
                             print(f"  [StreamManager] Low-level read error: {read_err}")
-                            break # Force reconnection
-                            
-                        if not ret or frame is None:
-                            print("  [StreamManager] Stream stalled. Reconnecting...")
-                            break
+                            break 
                         
                         # Set source resolution once
                         if self._source_h == 0:
