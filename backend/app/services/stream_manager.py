@@ -1,449 +1,481 @@
 import cv2
-import os
 import time
 import asyncio
 import numpy as np
 import threading
-from typing import Iterator
-from fastapi.responses import StreamingResponse
+import traceback
+from typing import Optional, List, Dict
 
 from app.services.face_engine import engine
-from app.core.database import get_db
-from datetime import datetime
+from app.services.scrfd import SCRFD
+from app.utils.alignment import align_face
+from app.services.recognizer import _get_detector
 from app.core.config import settings
-from app.core.constants import IST
-import torch
+import os
 
-# ── HOISTED IMPORTS (moved out of per-frame hot loop) ──
-from torchvision import transforms
-from PIL import Image
+# FFmpeg/OpenCV Stability: Use 2 threads for general work
+cv2.setNumThreads(2)
+# Global environment variable for FFmpeg options
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|threads;1"
+from ultralytics.trackers.byte_tracker import BYTETracker
 
-# ── HOISTED PREPROCESS PIPELINE (created once, reused every frame) ──
-_preprocess = transforms.Compose([
-    transforms.Resize((160, 160)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-])
-
-# JPEG encode params (quality 80 for streaming — saves ~40% encode time vs default 95)
-_JPEG_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-
-
-class StreamManager:
-    """
-    Manages background capturing from RTSP/Webcam, running ByteTrack,
-    generating embeddings, and maintaining the similarity buffer.
-
-    Performance optimizations applied:
-      1. Imports and transforms.Compose hoisted to module-level (not per-frame).
-      2. Numpy array slicing replaces PIL crop for face extraction.
-      3. ML Loop decoupled from Camera Loop: Camera runs at 30fps, ML runs asynchronously.
-      4. Bounding boxes are stateful and drawn smoothly on every frame without blinking.
-    """
-    def __init__(self, src=0):
-        self.src = src
+class EnterpriseStreamManager:
+    def __init__(self):
+        # ── Capture Loop (Producer) ──
+        self.rtsp_url = settings.ip_camera_url
         self.cap = None
-        self.is_running = False
-        self.paused = True
+        self._capture_thread = None
+        self._stop_event = threading.Event()
         
-        # Threads
-        self.cam_thread = None
-        self.ml_thread = None
-        
-        # Shared State (with lock)
-        self.current_frame = None
-        self.frame_for_ml = None
+        # ── Shared State (Thread-Safe) ──
+        self._latest_frame = None
         self._frame_lock = threading.Lock()
         
-        # Detections State: drawn on every frame by the camera loop
-        # Format: list of dicts {"box": [x1, y1, x2, y2], "text": str, "sim": float, "color": (B, G, R)}
-        self.current_detections = []
+        # ── Process Loop (Consumer) ──
+        self._process_thread = None
+        
+        # ── MJPEG Loop (Broadcaster) ──
+        self._mjpeg_thread = None
+        self._new_frame_event = threading.Event()
+        
+        # ── Annotations (Thread-Safe) ──
+        self._current_detections = []
         self._det_lock = threading.Lock()
         
-        # ByteTrack Similarity Buffer
-        self.track_buffer = {}
-        self.BUFFER_TIMEOUT = 15.0
-        self.REQUIRED_HITS = 2
+        # ── ByteTracker State ──
+        self.tracker = None 
         
-        # Cooldown map
-        self.last_scan_time = {}
+        # ── Identity Cache ──
+        self.identity_cache = {} 
+        self.last_scan_time = {} # For DB cooldowns
         
-        # Asyncio loops
-        self.main_loop = None
+        # ── Global AI-Annotated Buffer (Optimized for WebRTC) ──
+        self._latest_annotated_frame = None
+        self._annotated_lock = threading.Lock()
+        self._latest_jpeg = None
+        self._jpeg_lock = threading.Lock()
+        self.enable_mjpeg = True # Flag to avoid redundant encoding load
+        
+        # ── Lifecycle Locks ──
+        self._start_lock = threading.Lock()
+        
+        # ── Async Synchronization (Multi-subscriber support) ──
+        self.main_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._subscribers: List[asyncio.Queue] = []
+        self._sub_lock = threading.Lock()
 
-    def start(self):
-        if self.is_running:
-            return
+    def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+        """Starts the decoupled Producer (Camera) and Consumer (AI) threads safely."""
+        with self._start_lock:
+            # 1. If already active, don't restart (idempotent)
+            if not self._stop_event.is_set() and self._capture_thread and self._capture_thread.is_alive():
+                print("  [StreamManager] Stream already running. Skipping start.")
+                return
+
+            print("  [StreamManager] Initializing backend threads...")
             
-        try:
-            self.main_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            pass
+            if loop is None:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+            self.main_loop = loop
+            self._stop_event.clear()
+            
+            # Start Threads
+            self._capture_thread = threading.Thread(target=self._capture_loop, name="ProducerThread", daemon=True)
+            self._process_thread = threading.Thread(target=self._process_loop, name="ConsumerThread", daemon=True)
+            self._mjpeg_thread = threading.Thread(target=self._mjpeg_loop, name="BroadcasterThread", daemon=True)
+            
+            self._capture_thread.start()
+            self._process_thread.start()
+            self._mjpeg_thread.start()
+            print("  [StreamManager] All backend threads started.")
         
-        if not self.paused:
-            if os.name == 'nt':
-                self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
-            else:
-                self.cap = cv2.VideoCapture(self.src)
-                
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        
-        self.is_running = True
-        
-        # Start both decoupled threads
-        self.cam_thread = threading.Thread(target=self._cam_worker, daemon=True)
-        self.ml_thread = threading.Thread(target=self._ml_worker, daemon=True)
-        self.cam_thread.start()
-        self.ml_thread.start()
-        print(f"  [StreamManager] Started capturing from {self.src}")
-
     def stop(self):
-        self.is_running = False
-        if self.cam_thread:
-            self.cam_thread.join()
-        if self.ml_thread:
-            self.ml_thread.join()
-        if self.cap:
-            self.cap.release()
-        print("  [StreamManager] Stopped capture.")
-
-    def pause(self):
-        self.paused = True
+        """Safely signals all threads to stop and releases hardware resources."""
+        self._stop_event.set()
         if self.cap:
             self.cap.release()
             self.cap = None
-        print("  [StreamManager] Stream Paused, Hardware Released.")
-
+        
+        # Ensure latest frame is cleared so WebRTC doesn't stream stale data
+        with self._frame_lock:
+            self._latest_frame = None
+        with self._annotated_lock:
+            self._latest_annotated_frame = None
+            
+    def pause(self):
+        print("  [StreamManager] Pausing stream...")
+        self._stop_event.set()
+        if self.cap:
+            self.cap.release()
+            
     def resume(self):
-        if not self.paused:
-            return
-        time.sleep(1.0)
-        
-        if os.name == 'nt':
-            self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
-        else:
-            self.cap = cv2.VideoCapture(self.src)
+        print("  [StreamManager] Resuming stream...")
+        if self.main_loop:
+            self.start(self.main_loop)
             
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.paused = False
-        print("  [StreamManager] Stream Resumed.")
-
-    def _cam_worker(self):
-        """Camera loop: Fast reads 30fps, draws latest bounding boxes, updates frontend stream."""
-        while self.is_running:
-            try:
-                if self.paused or self.cap is None:
-                    time.sleep(0.5)
-                    continue
-                    
-                ret, frame = self.cap.read()
-                if not ret:
-                    self.cap.release()
-                    time.sleep(1.0)
-                    if os.name == 'nt':
-                        self.cap = cv2.VideoCapture(self.src, cv2.CAP_DSHOW)
-                    else:
-                        self.cap = cv2.VideoCapture(self.src)
-                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                    continue
-                
-                # Clone raw frame for ML thread (so drawing on it doesn't corrupt ML input)
-                with self._frame_lock:
-                    self.frame_for_ml = frame.copy()
-                
-                # Draw latest available detections onto this frame
-                with self._det_lock:
-                    for det in self.current_detections:
-                        self._draw_box(frame, det["box"], det["text"], det["sim"], det["color"])
-                
-                with self._frame_lock:
-                    self.current_frame = frame
-                    
-            except Exception as e:
-                print(f"  [StreamManager] Cam Thread Exception: {e}")
-                time.sleep(0.5)
-
-    def _ml_worker(self):
-        """ML loop: Runs entirely decoupled. Grabs newest frame, does YOLO+FaceNet, updates detections."""
-        while self.is_running:
-            try:
-                if self.paused:
-                    time.sleep(0.5)
-                    continue
-                
-                # Grab a frame safely
-                frame_idx_to_process = None
-                with self._frame_lock:
-                    if self.frame_for_ml is not None:
-                        frame_idx_to_process = self.frame_for_ml.copy()
-                        
-                if frame_idx_to_process is None:
-                    time.sleep(0.05)
-                    continue
-                    
-                self._process_frame(frame_idx_to_process)
-                
-                # Free CPU briefly
-                time.sleep(0.03)
-                
-            except Exception as e:
-                import traceback
-                print(f"  [StreamManager] ML Thread Exception: {e}")
-                traceback.print_exc()
-                time.sleep(0.5)
-
-    def _process_frame(self, frame: np.ndarray):
-        """Run ByteTrack + FaceNet + FAISS + Buffer Logic. Returns immediately, updates shared state."""
-        if not engine._initialized:
-            return
-            
-        # 1. YOLO-Face + ByteTrack
-        results = engine.yolo.track(frame, persist=True, conf=0.5, verbose=False)
+    # ── Producer Thread (Zero-Latency Video) ──────────────────────────────────
+    
+    def _capture_loop(self):
+        """Dedicated thread to pull frames from RTSP without delay."""
+        print(f"  [StreamManager] Starting Enterprise Capture: {self.rtsp_url}")
         
-        # If no faces, clear detection state and return
-        if len(results) == 0 or len(results[0].boxes) == 0 or results[0].boxes.id is None:
-            with self._det_lock:
-                self.current_detections = []
-            return
-            
-        boxes = results[0].boxes.xyxy.cpu().numpy()
-        track_ids = results[0].boxes.id.int().cpu().numpy()
-        
-        keypoints = None
-        if hasattr(results[0], 'keypoints') and results[0].keypoints is not None:
-            keypoints = results[0].keypoints.xy.cpu().numpy()
-        
-        now_ts = time.time()
-        
-        # Purge stale tracks memory
-        stale = [k for k, v in self.track_buffer.items() if now_ts - v["last_seen"] > self.BUFFER_TIMEOUT]
-        for k in stale:
-            del self.track_buffer[k]
-        
-        new_detections = []
-        tracks_needing_embedding = []
-        
-        # ── Fast path: Identify already-marked tracks ──
-        for box_idx, (box, t_id) in enumerate(zip(boxes, track_ids)):
-            if t_id in self.track_buffer and self.track_buffer[t_id]["marked_roll"]:
-                # Already confirmed
-                sim_val = self.track_buffer[t_id]["similarities"][-1] if self.track_buffer[t_id]["similarities"] else 0.0
-                new_detections.append({
-                    "box": box, "text": self.track_buffer[t_id]["marked_roll"], 
-                    "sim": sim_val, "color": (0, 255, 0)
-                })
-                self.track_buffer[t_id]["last_seen"] = now_ts
-            else:
-                tracks_needing_embedding.append((box_idx, t_id))
-        
-        # If we have tracked everyone successfully, just update detections and sleep
-        if not tracks_needing_embedding:
-            with self._det_lock:
-                self.current_detections = new_detections
-            return  
-        
-        # 2. Extract crops for unresolved tracks
-        valid_crops = []
-        valid_tracks = []
-        valid_box_indices = []
-        
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h_img, w_img, _ = img.shape
-        img_pil = Image.fromarray(img) 
-        
-        for box_idx, t_id in tracks_needing_embedding:
-            box = boxes[box_idx]
-            x1, y1, x2, y2 = map(int, box)
-            
-            w = x2 - x1
-            h = y2 - y1
-            if w < 40 or h < 40:
-                continue
-                
-            padx, pady = int(w * 0.1), int(h * 0.1)
-            x1 = max(0, x1 - padx)
-            y1 = max(0, y1 - pady)
-            x2 = min(w_img, x2 + padx)
-            y2 = min(h_img, y2 + pady)
-            
-            crop = img_pil.crop((x1, y1, x2, y2))
-            valid_crops.append(_preprocess(crop))
-            valid_tracks.append(t_id)
-            valid_box_indices.append(box_idx)
-            
-        if not valid_crops:
-            with self._det_lock:
-                self.current_detections = new_detections
-            return
-            
-        # 3. Batch Tensor -> embeddings (FP16)
-        batch_tensor = torch.stack(valid_crops).to(engine.device).half()
-        with torch.no_grad():
-            embeddings = engine.resnet(batch_tensor).float().cpu().numpy()
-            
-        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-        valid_mask = norms.flatten() > 0
-        embeddings = embeddings[valid_mask]
-        valid_tracks = [t for i, t in enumerate(valid_tracks) if valid_mask[i]]
-        valid_box_indices = [b for i, b in enumerate(valid_box_indices) if valid_mask[i]]
-        
-        if len(embeddings) == 0:
-            with self._det_lock:
-                self.current_detections = new_detections
-            return
-            
-        embeddings = (embeddings / norms[valid_mask]).astype(np.float32)
-        
-        # 4. Batch FAISS
-        distances, indices = engine.index.search(embeddings, k=1)
-        
-        # 5. Process tracking buffer
-        for i in range(len(embeddings)):
-            sim = float(distances[i][0])
-            idx = int(indices[i][0])
-            t_id = valid_tracks[i]
-            box_idx = valid_box_indices[i]
-            
-            if idx < 0 or idx >= len(engine.labels):
-                continue
-            closest_roll_no = engine.labels[idx]
-            
-            if t_id not in self.track_buffer:
-                self.track_buffer[t_id] = {"similarities": [], "last_seen": now_ts, "marked_roll": None, "current_roll": closest_roll_no}
-                
-            tb = self.track_buffer[t_id]
-            tb["last_seen"] = now_ts
-            
-            if tb["current_roll"] != closest_roll_no:
-                tb["current_roll"] = closest_roll_no
-                tb["similarities"] = []
-                
-            tb["similarities"].append(sim)
-            # Only keep last 3 similarities to evaluate max over recent window
-            if len(tb["similarities"]) > 3:
-                tb["similarities"].pop(0)
-                
-            if len(tb["similarities"]) < 1:  # Require 1 hit minimum
-                new_detections.append({
-                    "box": boxes[box_idx], "text": "Analyzing...", 
-                    "sim": sim, "color": (0, 255, 255)
-                })
-                continue
-                
-            # Use MAX similarity instead of AVERAGE to avoid drops from motion blur/angles
-            max_sim = max(tb["similarities"])
-            if max_sim >= settings.SIMILARITY_THRESHOLD:
-                # MARK ATTENDANCE!
-                tb["marked_roll"] = closest_roll_no
-                new_detections.append({
-                    "box": boxes[box_idx], "text": closest_roll_no, 
-                    "sim": max_sim, "color": (0, 255, 0)
-                })
-                if self.main_loop:
-                    asyncio.run_coroutine_threadsafe(self._log_attendance(closest_roll_no), self.main_loop)
-            else:
-                new_detections.append({
-                    "box": boxes[box_idx], "text": "Unknown", 
-                    "sim": max_sim, "color": (0, 0, 255)
-                })
-
-        # Atomic commit of all detection changes directly to the UI overlay
-        with self._det_lock:
-            self.current_detections = new_detections
-
-    def _draw_box(self, frame, box, text, sim, color):
-        x1, y1, x2, y2 = map(int, box)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, f"{text} {sim:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-    async def _log_attendance(self, roll_no: str):
-        """Writes to MongoDB tracking IN/OUT and Shift scheduling."""
         try:
-            print(f"  [StreamManager] Trying to log attendance for {roll_no}...")
-            now = datetime.now(IST)
-            now_ts = now.timestamp()
-            today_date = now.strftime("%Y-%m-%d")
-            
-            # 5-minute cooldown
-            if roll_no in self.last_scan_time and (now_ts - self.last_scan_time[roll_no]) < 300:
-                print(f"  [StreamManager] Ignored {roll_no} due to cooldown.")
-                return
-                
-            self.last_scan_time[roll_no] = now_ts
-            
-            db = get_db()
-            print(f"  [StreamManager] DB: {db}")
-            student = await db.students.find_one({"roll_no": roll_no})
-            if not student:
-                print(f"  [StreamManager] Student {roll_no} not found in DB.")
-                return
-                
-            existing = await db.attendance.find_one({"roll_no": roll_no, "date": today_date})
-            
-            config_doc = await db.settings.find_one({"_id": "global_config"})
-            sys_login = config_doc["login_time"] if config_doc and "login_time" in config_doc else getattr(settings, "LOGIN_TIME", "09:30:00")
-            sys_logout = config_doc["logout_time"] if config_doc and "logout_time" in config_doc else getattr(settings, "LOGOUT_TIME", "16:30:00")
-            
-            time_str = now.strftime("%H:%M:%S")
-            
-            if not existing:
-                # Login Event
-                login_thresh = datetime.strptime(today_date + " " + sys_login, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-                status = "On Time" if now <= login_thresh else "Late"
-                
-                await db.attendance.insert_one({
-                    "roll_no": roll_no,
-                    "name": student["name"],
-                    "branch": student["branch"],
-                    "date": today_date,
-                    "login_time": time_str,
-                    "login_status": status,
-                    "logout_time": None,
-                    "logout_status": None
-                })
-                msg = f"{student['name']} Logged In ({status})"
-                print(f"  [StreamManager] LOGIN: {msg}")
-            else:
-                login_time_str = existing.get("login_time")
-                if login_time_str:
-                    login_time_obj = datetime.strptime(today_date + " " + login_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-                    if (now - login_time_obj).total_seconds() < 2 * 3600:
-                        print(f"  [StreamManager] Ignored {roll_no} due to bounce cooldown.")
-                        return 
+            # Use TCP for stability and single thread for HEVC/FFMPEG assertion stability
+            import os
+            # Use different separator syntax for FFMPEG options to ensure they are parsed correctly
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|threads;1"
+            while not self._stop_event.is_set():
+                try:
+                    # Clear any old state before attempting open
+                    if self.cap: self.cap.release()
+                    
+                    print(f"  [StreamManager] Connecting to RTSP... {self.rtsp_url}")
+                    self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                    
+                    if not self.cap.isOpened():
+                        print("  [StreamManager] Link failed. Retrying in 5s...")
+                        time.sleep(5)
+                        continue
+                        
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                    
+                    # Target resolution for Kiosk (1280x720 720p HD)
+                    self.TARGET_WIDTH = 1280 
+                    self.TARGET_HEIGHT = 720 
+                    
+                    self._last_mjpeg_time = 0
+                    self._mjpeg_interval = 1.0 / 20.0 # 20 FPS is the perfect 'smooth' balance
 
-                # Logout Event
-                logout_thresh = datetime.strptime(today_date + " " + sys_logout, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-                status = "Logged Out" if now >= logout_thresh else "Early Logout"
-                
-                await db.attendance.update_one(
-                    {"_id": existing["_id"]},
-                    {"$set": {"logout_time": time_str, "logout_status": status}}
-                )
-                msg = f"{student['name']} {status}"
-                print(f"  [StreamManager] LOGOUT: {msg}")
-            
-            from app.api.routes.attendance import recent_marks
-            recent_marks.append({
-                "roll_no": roll_no, 
-                "name": student["name"], 
-                "message": msg,
-                "timestamp": time.time()
-            })
-            if len(recent_marks) > 20:
-                recent_marks.pop(0)
+                    frame_count = 0
+                    start_time = time.time()
+                    self._source_h, self._source_w = 0, 0 # Initialize
+
+                    while not self._stop_event.is_set():
+                        ret = False
+                        frame = None
+                        try:
+                            ret, frame = self.cap.read()
+                        except Exception as read_err:
+                            print(f"  [StreamManager] Low-level read error: {read_err}")
+                            break # Force reconnection
+                            
+                        if not ret or frame is None:
+                            print("  [StreamManager] Stream stalled. Reconnecting...")
+                            break
+                        
+                        # Set source resolution once
+                        if self._source_h == 0:
+                            self._source_h, self._source_w = frame.shape[:2]
+                            
+                        # Store latest frame
+                        with self._frame_lock:
+                            self._latest_frame = frame.copy()
+                        
+                        # Signal MJPEG and AI threads
+                        self._new_frame_event.set()
+                        
+                        frame_count += 1
+                        if frame_count % 300 == 0:
+                            fps = frame_count / (time.time() - start_time)
+                            print(f"  [StreamManager] Capture FPS: {fps:.2f}")
+
+                        time.sleep(0.001) 
+                    
+                except Exception as inner_e:
+                    print(f"  [StreamManager] Loop error: {inner_e}")
+                    time.sleep(2)
+                finally:
+                    if self.cap: self.cap.release()
+                    
         except Exception as e:
-            import traceback
-            print(f"  [StreamManager] Exception in _log_attendance: {e}")
+            print(f"  [StreamManager] FATAL Global Capture Error: {e}")
+            traceback.print_exc()
+        except Exception as e:
+            print(f"  [StreamManager] FATAL Capture Error: {e}")
             traceback.print_exc()
 
-    def get_frame_jpeg(self) -> bytes:
-        with self._frame_lock:
-            frame = self.current_frame
-        if frame is None:
-            return b""
-        ret, jpeg = cv2.imencode('.jpg', frame, _JPEG_PARAMS)
-        if not ret:
-            return b""
-        return jpeg.tobytes()
+    # ── Consumer Thread (Heavy AI Pipeline) ──────────────────────────────────
+    
+    def _init_tracker(self):
+        from types import SimpleNamespace
+        args = SimpleNamespace(
+            tracker_type='bytetrack', 
+            track_high_thresh=0.5, 
+            track_low_thresh=0.1, 
+            new_track_thresh=0.6, 
+            track_buffer=30, 
+            match_thresh=0.8,
+            fuse_score=True
+        )
+        self.tracker = BYTETracker(args=args, frame_rate=30)
+        
+    def _format_for_bytetrack(self, bboxes, scores):
+        if len(bboxes) == 0:
+            return np.empty((0, 6))
+        tracks = np.zeros((len(bboxes), 6), dtype=np.float32)
+        tracks[:, :4] = bboxes
+        tracks[:, 4] = scores
+        tracks[:, 5] = 0 # Class 0
+        return tracks
 
-streamer = StreamManager(src=0)
+    def _process_loop(self):
+        """Async processing thread for AI logic."""
+        print("  [StreamManager] Starting AI Consumer Thread")
+        
+        try:
+            engine.initialize()
+            
+            # 🔥 FAISS GPU Optimization: Move index to GPU for sub-millisecond search
+            try:
+                import faiss
+                res = faiss.StandardGpuResources()
+                engine.index = faiss.index_cpu_to_gpu(res, 0, engine.index)
+                print("  [StreamManager] FAISS moved to GPU 🔥")
+            except Exception as fe:
+                print(f"  [StreamManager] FAISS GPU fallback: {fe}")
+
+            detector = _get_detector()
+            self._init_tracker()
+            
+            proc_count = 0
+            start_time = time.time()
+
+            while not self._stop_event.is_set():
+                frame = None
+                with self._frame_lock:
+                    if self._latest_frame is not None:
+                        frame = self._latest_frame.copy()
+                
+                if frame is None:
+                    # Minor wait to avoid spinning
+                    time.sleep(0.005)
+                    continue
+                    
+                # 1. Detection
+                bboxes, scores, kpss = detector.detect(frame, thresh=0.5)
+                
+                if bboxes is None or len(bboxes) == 0:
+                    with self._det_lock:
+                        self._current_detections = []
+                    continue
+                    
+                # 2. Tracking (ByteTrack)
+                import torch
+                from ultralytics.engine.results import Boxes
+                try:
+                    track_input = self._format_for_bytetrack(bboxes, scores)
+                    det = Boxes(torch.tensor(track_input), frame.shape[:2])
+                    tracks = self.tracker.update(det, frame)
+                except Exception as track_err:
+                    print(f"  [StreamManager] Tracker warning: {track_err}")
+                    with self._det_lock:
+                        self._current_detections = [{"box": b.astype(int), "text": "Detecting...", "sim": 0, "color": (0,0,255)} for b in bboxes]
+                    continue
+                
+                new_detections = []
+                now_ts = time.time()
+                
+                # tracks: [x1, y1, x2, y2, id, conf, cls, idx]
+                for t in tracks:
+                    x1, y1, x2, y2, t_id, conf, cls, idx = t
+                    t_id = int(t_id)
+                    box_center = np.array([(x1+x2)/2, (y1+y2)/2])
+                    
+                    centers = np.array([[(b[0]+b[2])/2, (b[1]+b[3])/2] for b in bboxes])
+                    dists = np.linalg.norm(centers - box_center, axis=1)
+                    best_idx = np.argmin(dists)
+                    landmarks = kpss[best_idx]
+                    
+                    identity = self.identity_cache.get(t_id)
+                    needs_embedding = (identity is None) or (now_ts - identity["last_updated"] > 2.0)
+                        
+                    roll_no = "Unknown"
+                    color = (0, 0, 255)
+                    sim = 0.0
+                    
+                    if needs_embedding:
+                        face_aligned = align_face(frame, landmarks)
+                        if face_aligned is not None:
+                            embedding = engine.get_embedding(cv2.cvtColor(face_aligned, cv2.COLOR_BGR2RGB))
+                            embedding = np.expand_dims(embedding, axis=0).astype(np.float32)
+                            distances, indices = engine.index.search(embedding, k=1)
+                            
+                            found_sim = float(distances[0][0])
+                            found_idx = int(indices[0][0])
+                            
+                            # HIGHER is BETTER for IndexFlatIP (Inner Product / Cosine)
+                            # Threshold 0.65 is standard for high-security ArcFace
+                            if found_idx >= 0 and found_sim > 0.65:
+                                roll_no = engine.labels[found_idx]
+                                sim = found_sim # It's already Cosine
+                                color = (0, 255, 0) # Green for Recognized
+                                self.identity_cache[t_id] = {"roll_no": roll_no, "sim": sim, "color": color, "last_updated": now_ts}
+                                
+                                # Attendance Logic
+                                if roll_no not in self.last_scan_time or (now_ts - self.last_scan_time[roll_no] > 60):
+                                    from app.services.attendance_service import mark_attendance
+                                    asyncio.run_coroutine_threadsafe(mark_attendance(roll_no, "CCTV"), self.main_loop)
+                                    self.last_scan_time[roll_no] = now_ts
+                            else:
+                                self.identity_cache[t_id] = {"roll_no": "Unknown", "sim": found_sim, "color": (0, 0, 255), "last_updated": now_ts}
+                    else:
+                        roll_no = identity["roll_no"]
+                        sim = identity["sim"]
+                        color = identity["color"]
+                        
+                    new_detections.append({"box": (int(x1), int(y1), int(x2), int(y2)), "text": roll_no, "sim": sim, "color": color})
+
+                with self._det_lock:
+                    self._current_detections = new_detections
+                
+                proc_count += 1
+                if proc_count % 30 == 0:
+                    p_fps = proc_count / (time.time() - start_time)
+                    print(f"  [StreamManager] AI FPS: {p_fps:.2f}")
+
+        except Exception as e:
+            print(f"  [StreamManager] FATAL AI Error: {e}")
+            traceback.print_exc()
+
+    # ── MJPEG Broadcaster Thread (Enterprise Optimization) ───────────────────
+    
+    def _mjpeg_loop(self):
+        """Dedicated thread to pre-encode MJPEG frames for all subscribers."""
+        print("  [StreamManager] Starting MJPEG Broadcaster Thread")
+        
+        while not self._stop_event.is_set():
+            try:
+                # Wait for new frame from Capture Thread
+                if not self._new_frame_event.wait(timeout=1.0):
+                    continue
+                self._new_frame_event.clear()
+                
+                frame = None
+                with self._frame_lock:
+                    if self._latest_frame is not None:
+                        frame = self._latest_frame.copy()
+                
+                if frame is None:
+                    continue
+                
+                # 1. Capture a local copy of detections
+                with self._det_lock:
+                    detections = self._current_detections.copy()
+                
+                # 2. Resize FIRST (720p HD)
+                annotated = cv2.resize(frame, (self.TARGET_WIDTH, self.TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
+                
+                # 3. Scale & Draw Detections
+                # Calculate scale factors (Skip if source resolution not yet captured)
+                if self._source_w > 0 and self._source_h > 0:
+                    scale_x = self.TARGET_WIDTH / self._source_w
+                    scale_y = self.TARGET_HEIGHT / self._source_h
+                    
+                    for det in detections:
+                        x1, y1, x2, y2 = det["box"]
+                        # Scale coordinates to 720p
+                        sx1, sy1 = int(x1 * scale_x), int(y1 * scale_y)
+                        sx2, sy2 = int(x2 * scale_x), int(y2 * scale_y)
+                        
+                        color = det["color"]
+                        cv2.rectangle(annotated, (sx1, sy1), (sx2, sy2), color, 2)
+                        
+                        label = f"{det['text']} ({det['sim']:.2f})"
+                        cv2.putText(annotated, label, (sx1, sy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+                # ✅ STORE ANNOTATED FRAME (Zero-copy for WebRTC)
+                with self._annotated_lock:
+                    self._latest_annotated_frame = annotated
+
+                # 3. Only Encode MJPEG if there are active legacy subscribers
+                with self._sub_lock:
+                    has_subs = len(self._subscribers) > 0
+
+                if not has_subs:
+                    continue # SKIP JPEG ENCODING - Wastes CPU during WebRTC use
+
+                _, buffer = cv2.imencode('.jpg', annotated, self._JPEG_PARAMS)
+                jpeg_bytes = buffer.tobytes()
+                
+                with self._jpeg_lock:
+                    self._latest_jpeg = jpeg_bytes
+                
+                # 4. Notify all async subscribers (MJPEG legacy)
+                if self.main_loop:
+                    def safe_put(q):
+                        try: q.put_nowait(True)
+                        except asyncio.QueueFull: pass
+                        
+                    with self._sub_lock:
+                        for q in self._subscribers:
+                            self.main_loop.call_soon_threadsafe(safe_put, q)
+                            
+            except Exception as e:
+                print(f"  [StreamManager] MJPEG Loop warning: {e}")
+                time.sleep(0.1)
+
+    # ── MJPEG Delivery ────────────────────────────────────────────────────────
+    
+    _JPEG_PARAMS = [int(cv2.IMWRITE_JPEG_QUALITY), 40]
+    
+    def _draw_annotations(self, frame):
+        with self._det_lock:
+            detections = self._current_detections.copy()
+        for det in detections:
+            x1, y1, x2, y2 = det["box"]
+            color = det["color"]
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"{det['text']} {det['sim']:.2f}", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        return frame
+
+    async def get_frame_generator(self):
+        """Async generator with unique queue for each subscriber to prevent race conditions."""
+        queue = asyncio.Queue(maxsize=1)
+        with self._sub_lock:
+            self._subscribers.append(queue)
+        
+        print(f"  [StreamManager] New subscriber connected (Total: {len(self._subscribers)})")
+        
+        try:
+            while True:
+                # Wait for next frame signal
+                await queue.get()
+                
+                # Flush the queue to stay real-time
+                while not queue.empty():
+                    queue.get_nowait()
+                
+                # Fetch pre-computed JPEG buffer
+                jpeg_bytes = None
+                with self._jpeg_lock:
+                    jpeg_bytes = self._latest_jpeg
+                
+                if jpeg_bytes:
+                    # Enforce FPS cap
+                    now = time.time()
+                    elapsed = now - self._last_mjpeg_time
+                    if elapsed < self._mjpeg_interval:
+                        await asyncio.sleep(self._mjpeg_interval - elapsed)
+                    self._last_mjpeg_time = time.time()
+                    
+                    yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + jpeg_bytes + b'\r\n')
+        finally:
+            with self._sub_lock:
+                if queue in self._subscribers:
+                    self._subscribers.remove(queue)
+            print(f"  [StreamManager] Subscriber disconnected (Remaining: {len(self._subscribers)})")
+
+    def get_frame_jpeg(self) -> Optional[bytes]:
+        with self._frame_lock:
+            if self._latest_frame is None: return None
+            frame = self._latest_frame.copy()
+        frame = self._draw_annotations(frame)
+        _, buffer = cv2.imencode('.jpg', frame, self._JPEG_PARAMS)
+        return buffer.tobytes()
+
+streamer = EnterpriseStreamManager()

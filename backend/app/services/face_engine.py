@@ -1,74 +1,96 @@
-"""
-Face Recognition Engine — CUDA-accelerated singleton.
-
-This module holds the core engine class that loads all ML models onto GPU
-at startup. The actual recognition, registration, and deletion logic lives
-in separate modules:
-    - recognizer.py  → recognize(), recognize_multi()
-    - registrar.py   → register_faces(), delete_student()
-"""
-
 import os
 import pickle
 import numpy as np
 import faiss
-import torch
-from facenet_pytorch import InceptionResnetV1
+import cv2
+import onnxruntime as ort
 
-# Base directory (attendance_ai/)
+# Base directory
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+MODELS_DIR = os.path.join(BASE_DIR, "backend", "models", "insightface")
+
 FAISS_INDEX_PATH = os.path.join(BASE_DIR, "student_index.faiss")
 LABELS_PATH = os.path.join(BASE_DIR, "labels.pkl")
 
-IMAGE_SIZE = 160
-
-
 class FaceEngine:
-    """Singleton face recognition engine with GPU support."""
+    """Enterprise Face Recognition Engine using raw ONNX models with TensorRT."""
 
     def __init__(self):
-        self.device = None
-        self.yolo = None
-        self.resnet = None
+        self.det_model = None
+        self.rec_model = None
         self.index = None
         self.labels = None
         self._initialized = False
 
     def initialize(self):
-        """Load all models and data onto GPU."""
-        if self._initialized:
-            return
+        if self._initialized: return
 
-        # ── Device ──
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        gpu_info = ""
-        if self.device.type == "cuda":
-            gpu_info = f" ({torch.cuda.get_device_name(0)})"
-        print(f"  [FaceEngine] Device: {self.device}{gpu_info}")
+        # ── 0. DLL Path Configuration (Windows Only) ──
+        # Ensure we can find the CUDA/cuDNN DLLs inside the virtual environment
+        import sys
+        if sys.platform == "win32":
+            venv_path = os.path.dirname(os.path.dirname(os.path.dirname(MODELS_DIR)))
+            torch_lib = os.path.join(venv_path, "venv", "Lib", "site-packages", "torch", "lib")
+            ort_capi = os.path.join(venv_path, "venv", "Lib", "site-packages", "onnxruntime", "capi")
+            
+            if os.path.exists(torch_lib):
+                os.environ["PATH"] = torch_lib + os.pathsep + os.environ["PATH"]
+                if hasattr(os, "add_dll_directory"):
+                    try: os.add_dll_directory(torch_lib)
+                    except: pass
+            
+            if os.path.exists(ort_capi):
+                os.environ["PATH"] = ort_capi + os.pathsep + os.environ["PATH"]
+                if hasattr(os, "add_dll_directory"):
+                    try: os.add_dll_directory(ort_capi)
+                    except: pass
 
-        # ── YOLOv8 — Face detection ──
-        from ultralytics import YOLO
-        yolo_path = os.path.join(BASE_DIR, "yolov8n-face.pt")
-        self.yolo = YOLO(yolo_path)
-        self.yolo.to(self.device)
-        print("  [FaceEngine] YOLOv8-Face loaded")
+        # ── Execution Provider Selection ──
+        # Order: TensorRT (fastest) -> CUDA -> CPU
+        providers = ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+        
+        print(f"  [FaceEngine] Initializing with providers: {providers}")
 
-        # ── InceptionResnetV1 (embedding model) ──
-        self.resnet = InceptionResnetV1(pretrained="vggface2").eval().half().to(self.device)
-        print("  [FaceEngine] InceptionResnetV1 loaded (vggface2, FP16)")
+        # ── 1. Detection Model (SCRFD - det_10g.onnx) ──
+        det_path = os.path.join(MODELS_DIR, "det_10g.onnx")
+        self.det_model = ort.InferenceSession(det_path, providers=providers)
+        print("  [FaceEngine] SCRFD Detection loaded (ONNX/TensorRT)")
 
-        # ── FAISS index ──
+        # ── 2. Recognition Model (ArcFace - w600k_r50.onnx) ──
+        rec_path = os.path.join(MODELS_DIR, "w600k_r50.onnx")
+        self.rec_model = ort.InferenceSession(rec_path, providers=providers)
+        print("  [FaceEngine] ArcFace Embedding loaded (ONNX/TensorRT)")
+
+        # ── 3. Search Infrastructure ──
         self.index = faiss.read_index(FAISS_INDEX_PATH)
-        print(f"  [FaceEngine] FAISS index loaded: {self.index.ntotal} vectors")
-
-        # ── Labels ──
         with open(LABELS_PATH, "rb") as f:
             self.labels = pickle.load(f)
-        print(f"  [FaceEngine] Labels loaded: {len(set(self.labels))} unique students")
+        
+        print(f"  [FaceEngine] FAISS system ready ({self.index.ntotal} records)")
 
         self._initialized = True
-        print("  [FaceEngine] Ready for recognition")
+        print("  [FaceEngine] Enterprise stack online.")
 
+    def get_embedding(self, aligned_face):
+        """
+        Extracts ArcFace embedding from a 112x112 aligned face.
+        Expects RGB image with shape (112, 112, 3).
+        """
+        # Preprocessing: Transpose to (C, H, W) and normalize
+        img = aligned_face.astype(np.float32)
+        img = (img - 127.5) / 127.5
+        img = img.transpose((2, 0, 1))
+        img = np.expand_dims(img, axis=0) # Batch size 1
+        
+        # Inference
+        inputs = {self.rec_model.get_inputs()[0].name: img}
+        outs = self.rec_model.run(None, inputs)
+        feat = outs[0].flatten()
+        # Unit normalization for Cosine/L2 consistency
+        norm = np.linalg.norm(feat)
+        if norm > 1e-6:
+            feat = feat / norm
+        return feat
 
-# Global singleton instance
+# Global singleton
 engine = FaceEngine()

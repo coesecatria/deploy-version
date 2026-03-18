@@ -13,13 +13,15 @@ export const BRANCH_COLORS = {
     CIVIL: { bg: 'rgba(234, 88, 12, 0.08)', color: '#ea580c', gradient: 'linear-gradient(135deg, #ea580c, #f97316)' },
     CSD: { bg: 'rgba(236, 72, 153, 0.08)', color: '#ec4899', gradient: 'linear-gradient(135deg, #ec4899, #f472b6)' },
     CSDS: { bg: 'rgba(99, 102, 241, 0.08)', color: '#6366f1', gradient: 'linear-gradient(135deg, #6366f1, #818cf8)' },
+    MBA: { bg: 'rgba(71, 85, 105, 0.08)', color: '#475569', gradient: 'linear-gradient(135deg, #475569, #64748b)' },
+    MCA: { bg: 'rgba(192, 38, 211, 0.08)', color: '#c026d3', gradient: 'linear-gradient(135deg, #c026d3, #d946ef)' },
 };
 
 export const DEFAULT_BRANCH_STYLE = {
     bg: 'rgba(13, 148, 136, 0.08)', color: '#0d9488', gradient: 'linear-gradient(135deg, #0d9488, #14b8a6)'
 };
 
-export const BRANCHES = ['CSE', 'ECE', 'ME', 'EEE', 'CIVIL', 'ISE', 'AIML', 'CSD', 'CSDS'];
+export const BRANCHES = ['CSE', 'ECE', 'ME', 'EEE', 'CIVIL', 'ISE', 'AIML', 'CSD', 'CSDS', 'MBA', 'MCA'];
 
 export function getBranchStyle(branch) {
     return BRANCH_COLORS[branch?.toUpperCase()] || DEFAULT_BRANCH_STYLE;

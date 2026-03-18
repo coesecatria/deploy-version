@@ -2,7 +2,7 @@ import { createContext, useContext, useState, useEffect, useRef } from 'react';
 
 const AuthContext = createContext(null);
 
-const ADMIN_PIN = '1234';
+const ADMIN_PIN = 'Attendence_cybersec';
 const SESSION_DURATION = 5 * 60 * 1000; // 5 minutes in ms
 
 export function AuthProvider({ children }) {

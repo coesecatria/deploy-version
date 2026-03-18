@@ -98,7 +98,7 @@ export default function AnalyticsPage() {
                 ) : (
                     <>
                         <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 16 }}>
-                            <DatePicker value={date} onChange={setDate} />
+                            <DatePicker value={date} onChange={setDate} align="right" />
                         </div>
                         {/* ═══ KPI CARDS ROW ═══ */}
                         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }} className="fade-in">

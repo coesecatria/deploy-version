@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { api } from '../services/api';
 import { Download, Search } from 'lucide-react';
 import DatePicker from '../components/DatePicker';
+import { BRANCHES } from '../utils/branchColors';
 
 export default function AttendancePage() {
     const getLocalDate = () => {
@@ -62,7 +63,7 @@ export default function AttendancePage() {
             <div className="page-body">
                 {/* Filters */}
                 <div className="filter-bar fade-in" style={{ position: 'relative', zIndex: 10 }}>
-                    <DatePicker value={date} onChange={setDate} />
+                    <DatePicker value={date} onChange={setDate} align="right" />
 
                     <select
                         className="select"
@@ -71,15 +72,9 @@ export default function AttendancePage() {
                         style={{ maxWidth: 160 }}
                     >
                         <option value="">All Branches</option>
-                        <option value="CSE">CSE</option>
-                        <option value="ECE">ECE</option>
-                        <option value="ME">ME</option>
-                        <option value="EEE">EEE</option>
-                        <option value="CIVIL">CIVIL</option>
-                        <option value="ISE">ISE</option>
-                        <option value="AIML">AIML</option>
-                        <option value="CSD">CSD</option>
-                        <option value="CSDS">CSDS</option>
+                        {BRANCHES.map(b => (
+                            <option key={b} value={b}>{b}</option>
+                        ))}
                     </select>
 
                     <div style={{ position: 'relative' }}>

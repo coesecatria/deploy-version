@@ -48,103 +48,28 @@ async def mark_attendance(file: UploadFile = File(..., description="Image file w
             message=error,
         )
 
-    # Check similarity threshold
-    if similarity < settings.SIMILARITY_THRESHOLD:
+    # Check similarity threshold (ArcFace uses 0.4+ for match)
+    if similarity < 0.4:
         return RecognitionResult(
             success=False,
             roll_no=roll_no,
             similarity=round(similarity, 4),
             status="No Match",
-            message=f"Best match {roll_no} with similarity {similarity:.4f} is below threshold {settings.SIMILARITY_THRESHOLD}",
+            message=f"Best match {roll_no} with similarity {similarity:.4f} is below enterprise threshold (0.4)",
         )
 
-    # Lookup student info from DB
-    db = get_db()
-    student = await db.students.find_one({"roll_no": roll_no}, {"_id": 0})
-
-    if not student:
-        return RecognitionResult(
-            success=False,
-            roll_no=roll_no,
-            similarity=round(similarity, 4),
-            status="Error",
-            message=f"Student {roll_no} found in FAISS but not in database",
-        )
-
-    # Get current date/time in IST
-    now = datetime.now(IST)
-    today_date = now.strftime("%Y-%m-%d")
-    current_time = now.strftime("%H:%M:%S")
-
-    # Check if already marked today
-    existing = await db.attendance.find_one({
-        "roll_no": roll_no,
-        "date": today_date,
-    })
-
-    # Fetch dynamic settings
-    config_doc = await db.settings.find_one({"_id": "global_config"})
-    sys_login = config_doc["login_time"] if config_doc and "login_time" in config_doc else getattr(settings, "LOGIN_TIME", "09:30:00")
-    sys_logout = config_doc["logout_time"] if config_doc and "logout_time" in config_doc else getattr(settings, "LOGOUT_TIME", "16:30:00")
-
-    if existing:
-        # Minimum Cooldown Check (2 hours) to prevent bounce effect
-        login_time_str = existing.get("login_time")
-        if login_time_str:
-            login_time_obj = datetime.strptime(today_date + " " + login_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-            if (now - login_time_obj).total_seconds() < 2 * 3600:
-                return RecognitionResult(
-                    success=True,
-                    roll_no=roll_no,
-                    name=student["name"],
-                    branch=student["branch"],
-                    similarity=round(similarity, 4),
-                    status="Already Marked",
-                    message=f"{student['name']} already checked in (Cooldown Active)",
-                )
-
-        # LOGOUT
-        logout_thresh = datetime.strptime(today_date + " " + sys_logout, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-        status = "Logged Out" if now >= logout_thresh else "Early Logout"
-        
-        await db.attendance.update_one(
-            {"_id": existing["_id"]},
-            {"$set": {"logout_time": current_time, "logout_status": status}}
-        )
-        return RecognitionResult(
-            success=True,
-            roll_no=roll_no,
-            name=student["name"],
-            branch=student["branch"],
-            similarity=round(similarity, 4),
-            status=status,
-            message=f"Attendance updated for {student['name']} ({status})",
-        )
-
-    # LOGIN
-    login_thresh = datetime.strptime(today_date + " " + sys_login, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-    status = "On Time" if now <= login_thresh else "Late"
-
-    attendance_doc = {
-        "roll_no": roll_no,
-        "name": student["name"],
-        "branch": student["branch"],
-        "date": today_date,
-        "login_time": current_time,
-        "login_status": status,
-        "logout_time": None,
-        "logout_status": None,
-    }
-    await db.attendance.insert_one(attendance_doc)
-
+    # Call Unified Service
+    from app.services.attendance_service import mark_attendance as mark_logic
+    result = await mark_logic(roll_no, source="Photo")
+    
     return RecognitionResult(
-        success=True,
+        success=result["success"],
         roll_no=roll_no,
-        name=student["name"],
-        branch=student["branch"],
+        name=result.get("name"),
+        branch=result.get("branch"),
         similarity=round(similarity, 4),
-        status=status,
-        message=f"Attendance marked for {student['name']} ({status})",
+        status=result["status"],
+        message=result["message"]
     )
 
 

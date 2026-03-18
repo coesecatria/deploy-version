@@ -5,9 +5,11 @@ const DAYS = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December'];
 
-export default function DatePicker({ value, onChange, style }) {
+export default function DatePicker({ value, onChange, style, align = 'left' }) {
     const [open, setOpen] = useState(false);
     const ref = useRef(null);
+    const dropdownRef = useRef(null);
+    const [dropdownStyle, setDropdownStyle] = useState({});
 
     // Create a local date considering timezone
     const getLocalDate = () => {
@@ -29,6 +31,33 @@ export default function DatePicker({ value, onChange, style }) {
         document.addEventListener('mousedown', close);
         return () => document.removeEventListener('mousedown', close);
     }, []);
+
+    // Reposition dropdown so it stays within the viewport
+    useEffect(() => {
+        if (!open || !dropdownRef.current || !ref.current) return;
+        const trigger = ref.current.getBoundingClientRect();
+        const dd = dropdownRef.current;
+        const ddWidth = dd.offsetWidth || 300;
+        const vpWidth = window.innerWidth;
+        const margin = 8;
+
+        // Default: align to left edge of trigger
+        let left = 0;
+        const absLeft = trigger.left + left;
+        const absRight = absLeft + ddWidth;
+
+        if (absRight > vpWidth - margin) {
+            // Would overflow right — shift left so right edge aligns with trigger's right
+            left = trigger.width - ddWidth;
+        }
+        if (trigger.left + left < margin) {
+            // Would overflow left — pin to margin
+            left = margin - trigger.left;
+        }
+
+        setDropdownStyle({ left });
+    }, [open]);
+
 
     useEffect(() => {
         if (value) {
@@ -124,8 +153,8 @@ export default function DatePicker({ value, onChange, style }) {
             </button>
 
             {open && (
-                <div style={{
-                    position: 'absolute', top: 'calc(100% + 8px)', left: 0, zIndex: 9999,
+                <div ref={dropdownRef} style={{
+                    position: 'absolute', top: 'calc(100% + 8px)', zIndex: 9999,
                     background: 'rgba(255,255,255,0.92)',
                     backdropFilter: 'blur(24px) saturate(180%)',
                     WebkitBackdropFilter: 'blur(24px) saturate(180%)',
@@ -133,6 +162,7 @@ export default function DatePicker({ value, onChange, style }) {
                     boxShadow: '0 20px 64px rgba(0,0,0,0.08), 0 4px 16px rgba(0,0,0,0.03)',
                     padding: 20, width: 300, fontFamily: 'var(--font)',
                     animation: 'fadeIn 0.2s cubic-bezier(0.4,0,0.2,1)',
+                    ...dropdownStyle,
                 }}>
                     {/* Header */}
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
