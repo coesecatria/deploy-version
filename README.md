@@ -1,103 +1,127 @@
-# Attendance AI: Enterprise CCTV Facial Recognition System
+# Attend-AI: Enterprise WebRTC Face Recognition System 🚀
 
-A state-of-the-art backend/frontend software architecture for processing massive real-time CCTV streams, autonomously recognizing faces, and compiling dense attendance shifts into an interactive web dashboard.
+Attend-AI is a high-performance, real-time facial recognition and attendance system. It leverages **NVIDIA GPU acceleration (TensorRT/CUDA)** and **WebRTC** to deliver a sub-100ms latency video stream with live AI annotations, achieving over **80 FPS** on local hardware.
 
 ---
 
-## ⚡ Core Architecture
+## 💻 Hardware Requirements
 
-The system utilizes an enterprise-grade `app` segregation, breaking logic into dedicated domains for scalability and maintenance.
+To achieve the intended high-performance results (80+ FPS):
+- **GPU**: NVIDIA RTX 30-series, 40-series, or 50-series (Tested on **RTX 5070**).
+- **Environment**: Windows 10/11 or Ubuntu 20.04+.
+- **Drivers**: NVIDIA Driver 525+, CUDA 11.8+, cuDNN 8.9+.
 
-### Flow Diagram
+---
 
-```mermaid
-graph TD
-    %% Hardware Layer
-    Camera["CCTV Camera / RTSP Stream"] --> Cap["Stream Manager (Wait 3 Frames)"]
-    
-    %% AI Pipeline (Backend Services)
-    subgraph "Backend - AI Service Layer"
-        Cap -->|Frame| YOLO["YOLOv8-Face (CUDA)"]
-        YOLO -->|Crop + ByteTrack ID| FaceNet["FaceNet FP16 (CUDA)"]
-        FaceNet -->|512d Embedding| FAISS["FAISS Index"]
-        FAISS -->|Matching ID| Validator{"Sim > 0.70?"}
-    end
+## 🛠️ Prerequisites
 
-    %% State Logic (Backend Core)
-    subgraph "Session State & DB"
-        Validator -->|Yes| Buffer["Similarity Buffer (Avg last 5 frames)"]
-        Buffer -->|Confirmed| Log["Cooldown Block & Time Logic"]
-        Log -->|On Time / Late| DB[("MongoDB (Dual IN/OUT Shift)")]
-    end
+- **Python**: 3.10 or 3.11
+- **Node.js**: 18.x or higher
+- **MongoDB**: 6.0+ (Installed and running on `localhost:27017`)
+- **Camera**: An RTSP-capable IP Camera.
 
-    %% Frontend API 
-    DB --> API["FastAPI Routes"]
-    API --> React["React Frontend Dashboard"]
+---
+
+## 🚀 Installation & Setup
+
+### 1. Clone the Repository
+```powershell
+git clone https://github.com/coesecatria/deploy-version.git
+cd deploy-version
 ```
 
-## 🏗 Enterprise Directory Structure
-
-```text
-attendance_ai/
-├── backend/
-│   ├── app/                      # Enterprise Architecture Namespace
-│   │   ├── api/                  # FastAPI Application Controllers
-│   │   │   └── routes/           # (students.py, attendance.py)
-│   │   ├── core/                 # Foundation & Constants
-│   │   │   ├── config.py         # ENV Ingestion
-│   │   │   └── database.py       # Motor async connection pool
-│   │   ├── models/               # Pydantic schemas required by API
-│   │   ├── services/             # Distinct Business Logic
-│   │   │   ├── face_engine.py    # YOLOv8 + FaceNet + FAISS CUDA Pipeline
-│   │   │   └── stream_manager.py # Threading + Shift State Controller
-│   │   ├── seed.py               # Bulk upsert CSV migration tool
-│   │   └── main.py               # Uvicorn Bootstrapper
-├── frontend/                     # React Server
-│   ├── src/
-│   │   ├── components/
-│   │   │   └── dashboard/        # Decoupled stateless modules
-│   │   ├── pages/                # Views (Dashboard.jsx)
-│   │   └── services/             # Axios/Fetch api.js handler
-├── .env                          # Secret Variables (See .env.example)
-└── .gitignore                    # Comprehensive restriction overrides
-```
-
-## 🚀 Key Features
-
-1. **YOLOv8 + ByteTrack Pipeline:** `MTCNN` is fully deprecated. Registration and frame parsing both rely entirely on `yolov8n-face.pt` running aggressively fast on GPU natively. Faces are dynamically tracked across frames before recognition, averting misidentifications from quick blur vectors.
-2. **Half Precision (FP16):** Tensor operations for `InceptionResnetV1` run in `.half()` footprint mode, expanding concurrency threshold allowing massive 40-student 10FPS drops.
-3. **Shift Tracking Configs:** Shift properties are stored inside `global_config` in MongoDB, instantly syncing IN/OUT behavior thresholds (e.g., Late vs On-Time vs Early Logout) dynamically off the frontend GUI without a hard reload.
-4. **React Modularization:** The Dashboard is stripped away from unmaintainable inline components into segmented, independently scalable components (`ShiftSettings.jsx`, `StatCards.jsx`, `BranchBreakdown.jsx`, `ActivityFeed.jsx`).
-
-## 🛠 Setup & Installation
-
-**1. Database Configuration**
-Ensure MongoDB is running locally (`mongodb://localhost:27017` or atlas).
-
-Clone the `.env.example`:
-```bash
-cp .env.example .env
-```
-
-**2. Python Environment Setup**
-```bash
+### 2. Backend Setup
+```powershell
 cd backend
 python -m venv venv
-venv\Scripts\activate   # Windows
+.\venv\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-**3. Initializing AI & DB**
-```bash
-# Boot the server (auto-triggers seed.py if metadata.csv is populated)
-python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+### 3. Model & AI Files Setup
+The system requires specific pre-trained ONNX models for the RTX 5070 to accelerate.
+
+**Required Models** (Must be in `backend/models/insightface/`):
+- `det_10g.onnx`: SCRFD Detection model (Fastest/Accurate).
+- `w600k_r50.onnx`: ArcFace Recognition model (Large-scale accuracy).
+
+**Required Database Files** (Stored in project root):
+- `student_index.faiss`: The vector database for face embeddings.
+- `labels.pkl`: Mapping of embeddings to Roll Numbers.
+
+You can download/ensure these are present by running:
+```powershell
+python download_models.py
 ```
 
-**4. Frontend Launch**
-```bash
-cd frontend
+### 4. Frontend Setup
+```powershell
+cd ../frontend
 npm install
+```
+
+---
+
+## ⚙️ Configuration
+
+Open `backend/app/core/config.py` and set your RTSP URL:
+
+```python
+class Settings:
+    ip_camera_url = "rtsp://admin:YourPassword@172.16.x.x:554/stream"
+    mongodb_url = "mongodb://localhost:27017"
+```
+
+---
+
+## 🏃 Running the Application
+
+### Start the Backend
+In the `backend` folder (with `venv` active):
+```powershell
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### Start the Frontend
+In the `frontend` folder:
+```powershell
 npm run dev
 ```
+Open **`http://localhost:5173`** in your browser.
 
-Visit the frontend at `http://localhost:5173`. Shift Configurations are fully controllable via the global Settings module.
+---
+
+## 🧬 AI Database Management
+
+### Initial Re-indexing
+If you have images in `processed_dataset/`, run the bulk re-indexer to align and vectorize them on your GPU:
+```powershell
+python reindex_all.py
+```
+
+### Adding New Students
+1. Log in as Admin (**PIN: `Attendence_cybersec`**).
+2. Go to the **Register** page.
+3. The system will use your **Local Webcam** to capture 15 high-quality frames.
+4. The FAISS index will update in real-time.
+
+---
+
+## 💎 Key Features
+- **WebRTC Streaming**: Hardware-accelerated video delivery with zero browser lag.
+- **720p HD AI**: Crystal-clear detection at 1280x720 resolution.
+- **ByteTrack**: Advanced multi-object tracking for crowded environments (up to 70 faces).
+- **GPU Optimization**: Full TensorRT integration for sub-millisecond recognition.
+- **Unknown Detection**: Red-box labeling for high-security awareness.
+
+---
+
+## 🛠️ Troubleshooting
+- **Black Screen on Kiosk**: Ensure the RTSP URL is correct and the backend logs show "Connecting to RTSP...".
+- **CUDA Errors**: Verify `onnxruntime-gpu` is installed and CUDA DLLs are in your system PATH.
+- **Proxy Errors**: Ensure the backend is running on `port 8000` before starting the frontend.
+
+---
+*Built for High-Performance AI Surveillance.*
