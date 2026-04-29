@@ -29,12 +29,21 @@ env/
 .cuda/
 ENV/
 
-# ── ML / Large Binary Files ──
+# ── ML / Large Binary Files / AI Models ──
+# Datasets
 processed_dataset/
+
+# Database files
+student_index.faiss
+labels.pkl
 *.faiss
 *.pkl
-*.h5
-*.hdf5
+
+# AI Models
+yolov8n.pt
+yolov8n-face.pt
+backend/models/insightface/det_10g.onnx
+backend/models/insightface/w600k_r50.onnx
 *.onnx
 *.pt
 *.pth
