@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Attendance Report — Attend-AI</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Segoe UI', Arial, Helvetica, sans-serif;
+    font-size: 11px;
+    color: #1a1a2e;
+    background: #fff;
+    padding: 28px;
+  }
+
+  /* ── Header ── */
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    border-bottom: 3px solid #0d9488;
+    padding-bottom: 16px;
+    margin-bottom: 24px;
+  }
+  .header-left h1 {
+    font-size: 22px;
+    font-weight: 700;
+    color: #0d9488;
+    letter-spacing: -0.5px;
+  }
+  .header-left p { color: #6b7280; font-size: 11px; margin-top: 2px; }
+  .header-right { text-align: right; font-size: 11px; color: #6b7280; }
+  .header-right strong { color: #1a1a2e; display: block; font-size: 13px; }
+
+  /* ── Meta bar ── */
+  .meta-bar {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .meta-chip {
+    background: #f0fdfa;
+    border: 1px solid #99f6e4;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 11px;
+    color: #0f766e;
+    font-weight: 500;
+  }
+  .meta-chip span { color: #6b7280; font-weight: 400; margin-right: 4px; }
+
+  /* ── Summary cards ── */
+  .summary {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .card {
+    flex: 1;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 12px 16px;
+    text-align: center;
+  }
+  .card .num { font-size: 24px; font-weight: 700; color: #0d9488; }
+  .card .lbl { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+  .card.warn .num { color: #f59e0b; }
+  .card.danger .num { color: #ef4444; }
+  .card.blue .num { color: #3b82f6; }
+
+  /* ── Table ── */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  thead tr {
+    background: #0d9488;
+    color: #fff;
+  }
+  thead th {
+    padding: 10px 12px;
+    text-align: left;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+  }
+  tbody tr { border-bottom: 1px solid #f3f4f6; }
+  tbody tr:nth-child(even) { background: #f9fafb; }
+  tbody tr:last-child { border-bottom: none; }
+  tbody td { padding: 9px 12px; vertical-align: middle; }
+
+  .roll { font-weight: 600; color: #1a1a2e; font-size: 11.5px; }
+  .name { color: #374151; }
+  .time { font-family: monospace; font-size: 12px; font-weight: 600; color: #1a1a2e; }
+  .time-dash { color: #d1d5db; }
+
+  /* Status badges */
+  .badge {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 9.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .badge-green  { background: #d1fae5; color: #065f46; }
+  .badge-yellow { background: #fef3c7; color: #92400e; }
+  .badge-red    { background: #fee2e2; color: #991b1b; }
+  .badge-blue   { background: #dbeafe; color: #1e40af; }
+  .badge-gray   { background: #f3f4f6; color: #6b7280; }
+
+  /* Branch badge */
+  .branch {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 4px;
+    font-size: 9.5px;
+    font-weight: 700;
+    background: #e0f2fe;
+    color: #0369a1;
+  }
+
+  /* ── Footer ── */
+  .footer {
+    margin-top: 28px;
+    border-top: 1px solid #e5e7eb;
+    padding-top: 12px;
+    display: flex;
+    justify-content: space-between;
+    color: #9ca3af;
+    font-size: 10px;
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-left">
+    <h1>Attend-AI</h1>
+    <p>Face Recognition Attendance System — Atria Institute of Technology</p>
+  </div>
+  <div class="header-right">
+    <strong>Attendance Report</strong>
+    Generated: {{ generated_at }}<br>
+    Period: {{ period_label }}
+    {% if branch_filter %}<br>Branch: {{ branch_filter }}{% endif %}
+  </div>
+</div>
+
+<!-- Meta bar -->
+<div class="meta-bar">
+  <div class="meta-chip"><span>Period:</span>{{ period_label }}</div>
+  <div class="meta-chip"><span>Total Records:</span>{{ records | length }}</div>
+  {% if branch_filter %}
+  <div class="meta-chip"><span>Branch:</span>{{ branch_filter }}</div>
+  {% endif %}
+</div>
+
+<!-- Summary cards -->
+<div class="summary">
+  <div class="card">
+    <div class="num">{{ total }}</div>
+    <div class="lbl">Total Present</div>
+  </div>
+  <div class="card">
+    <div class="num">{{ on_time }}</div>
+    <div class="lbl">On Time</div>
+  </div>
+  <div class="card warn">
+    <div class="num">{{ late }}</div>
+    <div class="lbl">Late</div>
+  </div>
+  <div class="card blue">
+    <div class="num">{{ logged_out }}</div>
+    <div class="lbl">Logged Out</div>
+  </div>
+  <div class="card danger">
+    <div class="num">{{ early_logout }}</div>
+    <div class="lbl">Early Logout</div>
+  </div>
+</div>
+
+<!-- Table -->
+<table>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Roll No</th>
+      <th>Name</th>
+      <th>Branch</th>
+      <th>Date</th>
+      <th>Login Time</th>
+      <th>Status</th>
+      <th>Logout Time</th>
+      <th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in records %}
+    <tr>
+      <td style="color:#9ca3af">{{ loop.index }}</td>
+      <td class="roll">{{ r.roll_no }}</td>
+      <td class="name">{{ r.name }}</td>
+      <td><span class="branch">{{ r.branch }}</span></td>
+      <td>{{ r.date }}</td>
+      <td>
+        {% if r.login_time %}
+          <span class="time">{{ r.login_time }}</span>
+        {% else %}
+          <span class="time-dash">--:--:--</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if r.login_status == 'On Time' %}
+          <span class="badge badge-green">On Time</span>
+        {% elif r.login_status == 'Late' %}
+          <span class="badge badge-yellow">Late</span>
+        {% else %}
+          <span class="badge badge-gray">{{ r.login_status or '—' }}</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if r.logout_time %}
+          <span class="time">{{ r.logout_time }}</span>
+        {% else %}
+          <span class="time-dash">--:--:--</span>
+        {% endif %}
+      </td>
+      <td>
+        {% if r.logout_status == 'Logged Out' %}
+          <span class="badge badge-blue">Logged Out</span>
+        {% elif r.logout_status == 'Early Logout' %}
+          <span class="badge badge-red">Early Logout</span>
+        {% else %}
+          <span class="badge badge-gray">—</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr>
+      <td colspan="9" style="text-align:center;padding:32px;color:#9ca3af;">
+        No attendance records found for this period.
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<!-- Footer -->
+<div class="footer">
+  <span>Attend-AI — Automated Face Recognition Attendance System</span>
+  <span>{{ records | length }} record(s) exported</span>
+</div>
+
+</body>
+</html>

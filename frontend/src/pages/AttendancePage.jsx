@@ -1,9 +1,103 @@
 import { useState, useEffect } from 'react';
 import { api } from '../services/api';
-import { Download, Search } from 'lucide-react';
+import { Download, Search, X, Calendar, Database } from 'lucide-react';
 import DatePicker from '../components/DatePicker';
 import { BRANCHES } from '../utils/branchColors';
 
+// ── PDF Export Modal ──────────────────────────────────────────────────────────
+function ExportModal({ currentDate, currentBranch, onClose }) {
+    const baseUrl = import.meta.env.VITE_API_URL || '';
+
+    const download = (dateParam) => {
+        const params = new URLSearchParams();
+        if (dateParam) params.set('date', dateParam);
+        if (currentBranch) params.set('branch', currentBranch);
+        const url = `${baseUrl}/api/attendance-report/pdf?${params.toString()}`;
+        window.open(url, '_blank');
+        onClose();
+    };
+
+    return (
+        <div
+            id="pdf-export-modal-overlay"
+            style={{
+                position: 'fixed', inset: 0, zIndex: 1000,
+                background: 'rgba(0,0,0,0.45)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+            }}
+            onClick={(e) => e.target.id === 'pdf-export-modal-overlay' && onClose()}
+        >
+            <div style={{
+                background: 'var(--card-bg, #fff)',
+                border: '1px solid var(--border-color, #e5e7eb)',
+                borderRadius: 16,
+                padding: '28px 32px',
+                width: 380,
+                boxShadow: '0 20px 60px rgba(0,0,0,0.2)',
+                animation: 'fadeInUp 0.2s ease',
+            }}>
+                {/* Header */}
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <h3 style={{ fontSize: 17, fontWeight: 700, color: 'var(--text-primary)' }}>Export PDF Report</h3>
+                    <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 4, borderRadius: 6 }}>
+                        <X size={18} />
+                    </button>
+                </div>
+                <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 24 }}>
+                    Choose the date range for your attendance report.
+                    {currentBranch && <> Branch filter <strong>{currentBranch}</strong> will be applied.</>}
+                </p>
+
+                {/* Options */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <button
+                        id="pdf-export-today"
+                        onClick={() => download(currentDate)}
+                        style={{
+                            display: 'flex', alignItems: 'center', gap: 14,
+                            padding: '14px 18px', borderRadius: 10, border: '1.5px solid #0d9488',
+                            background: 'rgba(13,148,136,0.06)', cursor: 'pointer',
+                            transition: 'all 0.15s',
+                        }}
+                        onMouseEnter={e => e.currentTarget.style.background = 'rgba(13,148,136,0.14)'}
+                        onMouseLeave={e => e.currentTarget.style.background = 'rgba(13,148,136,0.06)'}
+                    >
+                        <div style={{ width: 38, height: 38, borderRadius: 8, background: '#ccfbf1', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            <Calendar size={18} color="#0d9488" />
+                        </div>
+                        <div style={{ textAlign: 'left' }}>
+                            <div style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>Today Only</div>
+                            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>{currentDate}</div>
+                        </div>
+                    </button>
+
+                    <button
+                        id="pdf-export-all"
+                        onClick={() => download(null)}
+                        style={{
+                            display: 'flex', alignItems: 'center', gap: 14,
+                            padding: '14px 18px', borderRadius: 10, border: '1.5px solid #6366f1',
+                            background: 'rgba(99,102,241,0.06)', cursor: 'pointer',
+                            transition: 'all 0.15s',
+                        }}
+                        onMouseEnter={e => e.currentTarget.style.background = 'rgba(99,102,241,0.14)'}
+                        onMouseLeave={e => e.currentTarget.style.background = 'rgba(99,102,241,0.06)'}
+                    >
+                        <div style={{ width: 38, height: 38, borderRadius: 8, background: '#e0e7ff', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                            <Database size={18} color="#6366f1" />
+                        </div>
+                        <div style={{ textAlign: 'left' }}>
+                            <div style={{ fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' }}>All Records</div>
+                            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Complete attendance history</div>
+                        </div>
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+// ── Main Page ─────────────────────────────────────────────────────────────────
 export default function AttendancePage() {
     const getLocalDate = () => {
         const d = new Date();
@@ -18,6 +112,7 @@ export default function AttendancePage() {
     const [date, setDate] = useState(getLocalDate());
     const [branch, setBranch] = useState('');
     const [rollSearch, setRollSearch] = useState('');
+    const [showExportModal, setShowExportModal] = useState(false);
 
     const fetchRecords = async () => {
         setLoading(true);
@@ -41,22 +136,27 @@ export default function AttendancePage() {
         return () => clearInterval(interval);
     }, [date, branch, rollSearch]);
 
-    const handleExport = () => {
-        const params = {};
-        if (date) params.date = date;
-        if (branch) params.branch = branch;
-        api.exportCSV(params);
-    };
-
     return (
         <>
+            {showExportModal && (
+                <ExportModal
+                    currentDate={date}
+                    currentBranch={branch}
+                    onClose={() => setShowExportModal(false)}
+                />
+            )}
+
             <div className="page-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <div>
                     <h2>Attendance Logs</h2>
                     <p>View and export attendance records</p>
                 </div>
-                <button className="btn btn-success" onClick={handleExport}>
-                    <Download size={16} /> Export CSV
+                <button
+                    id="export-pdf-btn"
+                    className="btn btn-success"
+                    onClick={() => setShowExportModal(true)}
+                >
+                    <Download size={16} /> Export PDF
                 </button>
             </div>
 
