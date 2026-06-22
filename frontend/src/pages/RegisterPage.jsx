@@ -164,7 +164,11 @@ export default function RegisterPage() {
                             <Webcam
                                 ref={webcamRef} audio={false}
                                 screenshotFormat="image/jpeg" screenshotQuality={0.92}
-                                videoConstraints={{ width: 1280, height: 720, facingMode: 'user' }}
+                                videoConstraints={{ width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }}
+                                onUserMediaError={(err) => {
+                                    console.error("Webcam Error:", err);
+                                    alert("Could not access camera. Please check browser permissions and ensure no other app is using it. Error: " + err.message);
+                                }}
                                 style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
                             />
                         ) : (

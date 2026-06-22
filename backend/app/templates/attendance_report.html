@@ -90,6 +90,15 @@
   tbody tr:nth-child(even) { background: #f9fafb; }
   tbody tr:last-child { border-bottom: none; }
   tbody td { padding: 9px 12px; vertical-align: middle; }
+  
+  .branch-header {
+    background-color: #f0fdfa !important;
+    font-weight: 700;
+    color: #0f766e;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 11px;
+  }
 
   .roll { font-weight: 600; color: #1a1a2e; font-size: 11.5px; }
   .name { color: #374151; }
@@ -184,7 +193,62 @@
   </div>
 </div>
 
+<!-- Analytics Charts -->
+{% if bar_chart_base64 or doughnut_chart_base64 %}
+<table style="width: 100%; margin-bottom: 24px; border: 1px solid #e5e7eb; border-radius: 8px;">
+  <tr>
+    {% if bar_chart_base64 %}
+    <td style="width: 50%; padding: 16px; text-align: center; vertical-align: middle;">
+      <img src="data:image/png;base64,{{ bar_chart_base64 }}" style="max-width: 100%; max-height: 220px; height: auto;" />
+    </td>
+    {% endif %}
+    {% if doughnut_chart_base64 %}
+    <td style="width: 50%; padding: 16px; text-align: center; vertical-align: middle; border-left: 1px solid #e5e7eb;">
+      <img src="data:image/png;base64,{{ doughnut_chart_base64 }}" style="max-width: 100%; max-height: 220px; height: auto;" />
+    </td>
+    {% endif %}
+  </tr>
+</table>
+{% endif %}
+
 <!-- Table -->
+{% if is_summary %}
+<table>
+  <thead>
+    <tr>
+      <th style="width: 5%;">#</th>
+      <th style="width: 15%;">Roll No</th>
+      <th style="width: 30%;">Name</th>
+      <th style="width: 15%; text-align: center;">Total Present</th>
+      <th style="width: 15%; text-align: center;">Days On Time</th>
+      <th style="width: 20%; text-align: center;">Days Late</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for branch, students in summary_data.items() %}
+      <tr class="branch-header">
+        <td colspan="6" style="padding-top: 14px; padding-bottom: 10px;">{{ branch }} Branch</td>
+      </tr>
+      {% for s in students %}
+      <tr>
+        <td style="color:#9ca3af">{{ loop.index }}</td>
+        <td class="roll">{{ s.roll_no }}</td>
+        <td class="name">{{ s.name }}</td>
+        <td style="text-align: center; font-weight: 600; color: #1a1a2e;">{{ s.total_present }}</td>
+        <td style="text-align: center;"><span class="badge badge-green">{{ s.on_time }}</span></td>
+        <td style="text-align: center;"><span class="badge badge-yellow">{{ s.late }}</span></td>
+      </tr>
+      {% endfor %}
+    {% else %}
+    <tr>
+      <td colspan="6" style="text-align:center;padding:32px;color:#9ca3af;">
+        No attendance records found.
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
 <table>
   <thead>
     <tr>
@@ -249,6 +313,7 @@
     {% endfor %}
   </tbody>
 </table>
+{% endif %}
 
 <!-- Footer -->
 <div class="footer">

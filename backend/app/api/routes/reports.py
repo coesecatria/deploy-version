@@ -4,11 +4,16 @@ Report routes — Attendance report, CSV export, PDF export, and statistics.
 
 import io
 import os
+import base64
+from collections import defaultdict
 from datetime import datetime
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse, Response
 from typing import Optional
 from jinja2 import Environment, FileSystemLoader
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from app.core.database import get_db
 from app.core.constants import IST
 from app.models.schemas import AttendanceRecord
@@ -111,6 +116,107 @@ async def export_attendance_pdf(
     period_label  = date if date else "All Records"
     branch_filter = branch.upper() if branch else None
 
+    # ── Compute Charts ──
+    branch_counts = defaultdict(int)
+    month_counts = defaultdict(int)
+
+    for r in records:
+        b = r.get("branch", "Unknown")
+        d = r.get("date", "")
+        branch_counts[b] += 1
+        if d and len(d) >= 7:
+            month = d[:7]  # YYYY-MM
+            month_counts[month] += 1
+
+    bar_chart_base64 = ""
+    doughnut_chart_base64 = ""
+
+    if records:
+        # Generate Doughnut Chart
+        fig1, ax1 = plt.subplots(figsize=(4, 3))
+        labels = list(branch_counts.keys())
+        sizes = list(branch_counts.values())
+        if sizes:
+            # Adjust font sizes and distance to avoid overlap
+            wedges, texts, autotexts = ax1.pie(
+                sizes, 
+                labels=labels, 
+                autopct='%1.1f%%', 
+                startangle=90, 
+                wedgeprops=dict(width=0.3, edgecolor='w'),
+                pctdistance=0.8,
+                labeldistance=1.15,
+                textprops={'fontsize': 8}
+            )
+            for autotext in autotexts:
+                autotext.set_fontsize(7)
+                autotext.set_color('white')
+            
+            ax1.axis('equal')
+            plt.title('Branch-wise Attendance', fontsize=10, pad=10)
+            plt.tight_layout()
+            buf1 = io.BytesIO()
+            fig1.savefig(buf1, format='png', transparent=True, dpi=150)
+            buf1.seek(0)
+            doughnut_chart_base64 = base64.b64encode(buf1.read()).decode('utf-8')
+            plt.close(fig1)
+
+        # Generate Bar Chart
+        fig2, ax2 = plt.subplots(figsize=(4, 3))
+        m_labels = sorted(list(month_counts.keys()))
+        m_sizes = [month_counts[m] for m in m_labels]
+        if m_sizes:
+            bars = ax2.bar(m_labels, m_sizes, color='#0d9488', width=0.6)
+            ax2.set_ylabel('Attendance Count', fontsize=8)
+            ax2.set_title('Monthly Attendance', fontsize=10, pad=10)
+            ax2.tick_params(axis='both', which='major', labelsize=8)
+            
+            # Remove top and right borders for a cleaner look
+            ax2.spines['top'].set_visible(False)
+            ax2.spines['right'].set_visible(False)
+            
+            plt.xticks(rotation=0)  # Straight text is usually better if few months
+            plt.tight_layout()
+            buf2 = io.BytesIO()
+            fig2.savefig(buf2, format='png', transparent=True, dpi=150)
+            buf2.seek(0)
+            bar_chart_base64 = base64.b64encode(buf2.read()).decode('utf-8')
+            plt.close(fig2)
+
+    # ── Group Records for Summary Report (if no date specified) ──
+    is_summary = date is None
+    summary_data = {}
+    
+    if is_summary:
+        for r in records:
+            b = r.get("branch", "Unknown")
+            roll = r.get("roll_no")
+            name = r.get("name")
+            if b not in summary_data:
+                summary_data[b] = {}
+            if roll not in summary_data[b]:
+                summary_data[b][roll] = {
+                    "name": name,
+                    "total_present": 0,
+                    "on_time": 0,
+                    "late": 0
+                }
+            
+            summary_data[b][roll]["total_present"] += 1
+            if r.get("login_status") == "On Time":
+                summary_data[b][roll]["on_time"] += 1
+            elif r.get("login_status") == "Late":
+                summary_data[b][roll]["late"] += 1
+                
+        # Convert to list and sort by roll number
+        for b in summary_data:
+            summary_data[b] = sorted(
+                [{"roll_no": k, **v} for k, v in summary_data[b].items()],
+                key=lambda x: x["roll_no"]
+            )
+        # Sort branches alphabetically
+        summary_data = dict(sorted(summary_data.items()))
+
     template = _jinja_env.get_template("attendance_report.html")
     html_content = template.render(
         records=records,
@@ -122,6 +228,10 @@ async def export_attendance_pdf(
         late=late,
         logged_out=logged_out,
         early_logout=early_logout,
+        bar_chart_base64=bar_chart_base64,
+        doughnut_chart_base64=doughnut_chart_base64,
+        is_summary=is_summary,
+        summary_data=summary_data,
     )
 
     # ── Render PDF with xhtml2pdf ──
