@@ -50,6 +50,16 @@ backend/models/insightface/w600k_r50.onnx
 *.model
 *.weights
 
+# Large Archive / Binary Files (exceeds GitHub's 100MB limit)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.7z
+*.rar
+backend/models/insightface/buffalo_l.zip
+
 # ── Node / Frontend ──
 frontend/node_modules/
 frontend/dist/
